@@ -37,7 +37,7 @@ SYSCTL_CONF="/etc/sysctl.conf"
 echo "--- Phase 1: Checking Kernel Parameters ---"
 
 # A. Runtime Check (Immediate Fix)
-CURRENT_RUNTIME_MAP=$(sysctl -n vm.max_map_count)
+CURRENT_RUNTIME_MAP=$(sudo sysctl -n vm.max_map_count)
 if [ "$CURRENT_RUNTIME_MAP" -lt "$REQUIRED_MAX_MAP" ]; then
     echo "Limit too low ($CURRENT_RUNTIME_MAP). Updating immediately..."
     sudo sysctl -w vm.max_map_count=$REQUIRED_MAX_MAP
