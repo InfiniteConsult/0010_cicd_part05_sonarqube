@@ -49,9 +49,9 @@ fi
 echo "    Checking persistence in $SYSCTL_CONF..."
 
 # Check if entry exists (handling optional leading whitespace)
-if grep -q "^\s*vm.max_map_count" "$SYSCTL_CONF"; then
+if sudo grep -q "^\s*vm.max_map_count" "$SYSCTL_CONF"; then
     # Value exists, extract it (handling spaces around '=')
-    STORED_VAL=$(grep "^\s*vm.max_map_count" "$SYSCTL_CONF" | awk -F= '{print $2}' | tr -d '[:space:]')
+    STORED_VAL=$(sudo grep "^\s*vm.max_map_count" "$SYSCTL_CONF" | awk -F= '{print $2}' | tr -d '[:space:]')
 
     # Ensure we captured a number
     if [[ ! "$STORED_VAL" =~ ^[0-9]+$ ]]; then
