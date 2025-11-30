@@ -67,7 +67,7 @@ docker run -d \
   --volume sonarqube-data:/opt/sonarqube/data \
   --volume sonarqube-extensions:/opt/sonarqube/extensions \
   --volume sonarqube-logs:/opt/sonarqube/logs \
-  sonarqube:community
+  sonarqube-custom:latest
 
 echo "SonarQube container started."
 echo "   It will take 2-3 minutes to initialize Elasticsearch."
