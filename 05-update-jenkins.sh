@@ -50,7 +50,7 @@ fi
 
 echo "Injecting SonarQube secrets into jenkins.env..."
 
-# Idempotency check using grep
+# Idempotency check using grep to prevent duplicate entries
 if ! grep -q "SONAR_AUTH_TOKEN" "$JENKINS_ENV_FILE"; then
 cat << EOF >> "$JENKINS_ENV_FILE"
 
@@ -80,6 +80,7 @@ if [ ! -x "$DEPLOY_SCRIPT" ]; then
 fi
 
 # Execute the deploy script from its own directory context
+# This ensures it finds the Dockerfile and other assets correctly
 (cd "$JENKINS_MODULE_DIR" && ./03-deploy-controller.sh)
 
 echo "Integration update complete."
