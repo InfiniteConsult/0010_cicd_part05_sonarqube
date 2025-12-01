@@ -10,8 +10,8 @@ import sys
 # We verify from the perspective of the 'dev-container'
 # using the internal Docker DNS name.
 TARGET_URL = "http://sonarqube.cicd.local:9000/api/system/status"
-MAX_RETRIES = 5
-WAIT_SECONDS = 2
+MAX_RETRIES = 20
+WAIT_SECONDS = 5
 
 def verify_sonarqube():
     print(f"--- Starting SonarQube Verification ---")
