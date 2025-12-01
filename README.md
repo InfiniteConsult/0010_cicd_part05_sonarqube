@@ -1128,3 +1128,162 @@ With the patch applied, we must rebuild the agent image.
 The `Incompatible GCC/GCOV version` error vanishes. CMake now correctly picks up our `ENV CC` variable, uses GCC 15 for compilation, and produces binaries compatible with our GCOV 15 analyzer.
 
 However, solving one problem reveals another. The logs now show a new warning: `lcov: WARNING: (inconsistent) ...`. We have fixed the toolchain, but now we must tune the analyzer. This leads us to our next challenge.
+
+# Chapter 7: The "Missing Language" - C/C++ and the Community Plugin
+
+## 7.1 The "Paywall" Limitation
+
+With our toolchain crisis resolved, the pipeline successfully completed a full execution. The compiler built our C, C++, Rust, and Python binaries using the correct GCC 15 instruction set. The scanner uploaded the report, and the dashboard populated.
+
+But a quick audit of the SonarQube dashboard reveals a glaring omission. We see lines of code for **Python**. We see lines of code for **Rust**. But our **C** and **C++** implementations—which constitute the core performance logic of our "Hero Project"—are completely missing. They are not just reporting zero coverage; they are invisible.
+
+This is not a configuration error; it is a feature gate.
+
+The **SonarQube Community Build** explicitly excludes C and C++ analysis from its feature set. These languages are reserved for the paid **Developer Edition**. For a standard enterprise, paying for this feature is often the correct path. However, for our "First Principles" laboratory, we are operating under the constraint of using open-source infrastructure.
+
+We cannot accept a partial view of our codebase. Our project contains distinct, idiomatic implementations in C23 and C++23. If we cannot inspect them, we cannot guarantee their quality. To solve this without breaking our budget, we must turn to the open-source ecosystem: the **Community C++ Plugin (`sonar-cxx`)**.
+
+This plugin is a robust alternative to the official analyzer. It provides full support for C and C++ parsing, metric calculation, and—crucially for our next chapter—native ingestion of coverage reports. However, installing it into a containerized, immutable architecture presents a new logistical challenge.
+
+## 7.2 The "Hot-Patch" Strategy
+
+In a standard Docker build, we would simply add a `ADD` or `COPY` instruction to our `Dockerfile` to bake the plugin into the image. However, our architecture prevents this.
+
+In **Article 5**, we made a deliberate architectural decision to persist the SonarQube extensions directory using a **Named Volume** (`sonarqube-extensions`). This ensures that if we upgrade the container image, we don't lose our installed plugins.
+
+However, this persistence creates a deployment constraint: **Volume Masking**.
+When Docker mounts a volume at `/opt/sonarqube/extensions`, it overlays the volume's contents on top of the container's filesystem. If we baked the plugin into the image at that path, the empty volume would mask it at runtime, effectively making it disappear.
+
+Therefore, we cannot install this plugin at build time. We must perform a **"Hot-Patch."** We will download the plugin to our Host machine and inject it directly into the running container's volume stream.
+
+**The "Toolkit" Trap**
+Before we script this, we must heed a specific warning from the plugin maintainers. The release artifacts for `sonar-cxx` include two JAR files:
+1.  `sonar-cxx-plugin-x.y.z.jar`: The actual plugin.
+2.  `cxx-sslr-toolkit-x.y.z.jar`: A standalone command-line debugging tool.
+
+It is a common mistake to copy *both* files into the plugins directory. **Do not do this.** The toolkit is not a SonarQube plugin; it lacks the required manifest metadata. If you place it in the plugins folder, SonarQube will attempt to load it, fail to find the plugin key, and crash the web server with a `java.lang.NullPointerException`. We must be surgical, installing only the plugin JAR.
+
+
+## 7.3 The Installer Script (`06-install-cxx-plugin.sh`)
+
+To execute this "Hot-Patch" reliably, we will encapsulate the logic in a script. This script acts as a bridge between the external open-source ecosystem and our internal, immutable infrastructure.
+
+It performs a precise sequence of operations:
+
+1.  **Fetch:** It downloads the specific, pinned version of the plugin (`2.2.1`) to the Host machine. This avoids relying on `wget` or `curl` being present inside the minimal SonarQube container image.
+2.  **Clean:** It removes any existing versions of the plugin from the container's volume. This prevents version conflicts (e.g., having both v2.1 and v2.2 JARs loaded simultaneously), which causes startup crashes.
+3.  **Inject:** It uses `docker cp` to surgically insert the JAR into the running container's file stream.
+4.  **Secure:** It repairs the file permissions. Files copied from the host often arrive owned by `root`. SonarQube runs as `sonarqube` (UID 1000). If we don't fix this ownership, the application will crash with `Permission Denied` when it tries to load the class.
+5.  **Reload:** It restarts the container to force the Java Classloader to pick up the new library.
+
+Create this file at `~/cicd_stack/sonarqube/06-install-cxx-plugin.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               06-install-cxx-plugin.sh
+#
+#  Installs the Community C++ Plugin (sonar-cxx) into the
+#  running SonarQube container.
+#
+#  We do this post-deployment because the 'extensions'
+#  directory is a mounted volume, which obscures any
+#  plugins we might try to bake into the Docker image.
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- Configuration ---
+# We pin the version to ensure reproducibility
+PLUGIN_VERSION="2.2.1.1248"
+PLUGIN_RELEASE="cxx-2.2.1"
+PLUGIN_JAR="sonar-cxx-plugin-${PLUGIN_VERSION}.jar"
+DOWNLOAD_URL="https://github.com/SonarOpenCommunity/sonar-cxx/releases/download/${PLUGIN_RELEASE}/${PLUGIN_JAR}"
+
+CONTAINER_NAME="sonarqube"
+CONTAINER_PLUGIN_DIR="/opt/sonarqube/extensions/plugins"
+
+echo "Starting C++ Plugin Installation..."
+
+# --- 1. Download Plugin to Host ---
+# We download to the host first to avoid dependency issues inside the container
+echo "Downloading $PLUGIN_JAR..."
+wget -q --show-progress "$DOWNLOAD_URL"
+
+if [ ! -f "$PLUGIN_JAR" ]; then
+    echo "ERROR: Download failed."
+    exit 1
+fi
+
+# --- 2. Remove Old Versions ---
+# We check if an older version exists in the container and remove it
+# to prevent classpath conflicts (having two versions of the same plugin).
+echo "Checking for existing C++ plugins..."
+docker exec "$CONTAINER_NAME" \
+    bash -c "rm -f $CONTAINER_PLUGIN_DIR/sonar-cxx-plugin-*.jar"
+
+# --- 3. Install New Plugin ---
+echo "Installing new plugin..."
+docker cp "$PLUGIN_JAR" "$CONTAINER_NAME:$CONTAINER_PLUGIN_DIR/"
+
+# --- 4. Fix Permissions ---
+# The file copied from host arrives owned by root.
+# SonarQube runs as UID 1000. We must fix this or the app crashes.
+echo "Fixing permissions..."
+docker exec -u 0 "$CONTAINER_NAME" \
+    chown 1000:1000 "$CONTAINER_PLUGIN_DIR/$PLUGIN_JAR"
+
+# --- 5. Cleanup Host File ---
+rm "$PLUGIN_JAR"
+
+# --- 6. Restart SonarQube ---
+echo "Restarting SonarQube to load plugin..."
+docker restart "$CONTAINER_NAME"
+
+echo "Plugin installed. Please verify in Administration > Marketplace > Installed."
+```
+
+### Execution
+
+Run this script from your host machine:
+
+```bash
+chmod +x 06-install-cxx-plugin.sh
+./06-install-cxx-plugin.sh
+```
+
+Once the script completes and SonarQube restarts (which may take 2 minutes), log in to the UI and navigate to **Administration \> Marketplace**. You should see the **CXX (Community)** plugin listed in the "Installed" tab. The engine is now capable of understanding C++.
+
+## 7.4 Configuration: Enabling the Sensors
+
+With the plugin physically present in the container's volume, we must now instruct the scanner to use it.
+
+If you were to run the build immediately after the restart, the dashboard would likely remain unchanged. This is because SonarQube scanners operate on a strictly **Opt-In** basis for file extensions. The default Java scanner claims `.java` files; the Python scanner claims `.py` files. Since the Community Build has no native C++ scanner, `.cpp` and `.h` files are currently "orphaned"—they belong to no one, so they are ignored during the indexing phase.
+
+We must explicitly assign these extensions to our new `cxx` plugin.
+
+We do this by updating our client-side configuration file, `sonar-project.properties`. While we will provide a comprehensive breakdown of this file's architecture—including Analysis Scopes and Test definitions—in **Chapter 9**, for now, we focus on the single property required to wake up the C++ sensors.
+
+**Action: Update `sonar-project.properties`**
+
+Add the following line to your configuration file:
+
+```properties
+# --- LANGUAGE SPECIFICS ---
+# The sonar-cxx plugin uses these suffixes to claim ownership of files
+sonar.cxx.file.suffixes=.cxx,.cpp,.cc,.c,.h,.hpp
+```
+
+**Verification:**
+Commit this change and trigger the **`0004_std_lib_http_client`** job in Jenkins.
+
+When the analysis completes, check the SonarQube dashboard. You will notice a significant change:
+
+1.  **Lines of Code:** The total count will jump. You will see a new entry for **C++** (or "CFamily") in the language breakdown.
+2.  **Issues:** You may start seeing "Code Smells" or style warnings generated by the plugin's internal rules.
+3.  **Coverage:** This will likely still be **0.0%**.
+
+We have solved the **Indexing** problem (the files are visible), but we have not solved the **Metrics** problem. The plugin sees the code, but it cannot read the coverage report because the data format we are generating (LCOV) is clashing with the plugin's path resolution logic. This leads us to our next battle: The Data Format War.
