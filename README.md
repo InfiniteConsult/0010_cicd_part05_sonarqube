@@ -1451,3 +1451,162 @@ When the build completes, open the SonarQube dashboard. You will witness the fin
 3.  **Coverage:** The "0.0%" is gone. You should see a valid coverage percentage (likely \>90% given our test suite) for your `.cpp` files.
 
 We have achieved what the official documentation implies is impossible for the Community Build: full, polyglot coverage analysis for C++, Rust, and Python in a single pipeline.
+
+# Chapter 9: Tuning the Signal - Scopes and Exclusions
+
+## 9.1 The "Low Signal" Mystery
+
+With our format wars resolved, we triggered another build. The results on the SonarQube dashboard were a mixed bag of triumph and confusion.
+
+On one hand, our **C++** coverage—previously a flat zero—had surged to over 90%, vindicating our efforts with the `sonar-cxx` plugin and the Cobertura converter. The scanner was successfully mapping the execution traces back to the source files.
+
+On the other hand, our **Python** coverage sat at a dismal **24.8%**. Even more alarming, our **Rust** code showed no coverage data at all, despite our logs confirming that `cargo-llvm-cov` had run successfully.
+
+We faced a new problem: **Signal-to-Noise Ratio**. We were piping data into the system, but the metrics were skewed. To understand why, we performed a forensic audit of the Python metrics.
+
+Drilling down into the **Code** tab for the Python module, we found the culprit immediately. Files like `src/python/tests/test_httppy.py` were marked with a red bar indicating **0.0% Coverage**.
+
+This revealed a fundamental misconfiguration in our **Analysis Scope**. By default, if you do not explicitly tell SonarQube otherwise, it assumes *every* file inside the `sonar.sources` directory is production code that must be tested.
+
+Our pipeline was calculating the coverage **of** our tests, rather than the coverage **by** our tests.
+
+Since test files generally do not test themselves, they report 0% coverage. In a project where the volume of test code roughly equals the volume of application code (a sign of a healthy project), this misconfiguration mathematically halts your coverage score at 50%. To fix this, we must teach the Inspector to distinguish between the *Target* (Source) and the *Evidence* (Tests).
+
+## 9.2 Defining the Scope (`sonar.sources` vs. `sonar.tests`)
+
+To fix this, we must explicitly define our **Analysis Scope** in `sonar-project.properties`. We need to decouple what is *scanned* from what is *measured*.
+
+This requires a clear understanding of two properties that often confuse beginners:
+
+1.  **`sonar.sources`**: This defines your **Production Code**. SonarQube will scan these files for bugs, code smells, and vulnerabilities. Crucially, these are the files that *must* be covered by tests. If a file is here, any uncovered line penalizes your score.
+2.  **`sonar.tests`**: This defines your **Test Code**. SonarQube will scan these files for test-specific issues (e.g., "Assertion in a loop"), but it will **exempt** them from coverage calculations. It understands that these files exist to *provide* coverage, not to *consume* it.
+
+Our fix is to physically separate our directories into these two buckets.
+
+**Action: Update `sonar-project.properties`**
+
+We will edit our properties file to explicitly list `src/python/tests` under `sonar.tests`, removing it from the default source scope.
+
+```properties
+# --- ANALYSIS SCOPE ---
+
+# 1. Main Sources (Targets for Coverage)
+# We include 'src' (code) and 'include' (C++ headers)
+sonar.sources=src,include
+
+# 2. Test Sources (Providers of Coverage)
+# We explicitly list the top-level 'tests' folder AND the python-specific tests
+sonar.tests=tests, src/python/tests
+```
+
+By making this distinction, we tell the Inspector: "Analyze `src/python/httppy` to see if it is tested. Analyze `src/python/tests` to see if the tests themselves are well-written, but do not demand that I write tests for my tests."
+
+This single change instantly corrects the math, removing thousands of lines of "uncovered" test code from the denominator of our coverage equation.
+
+## 9.3 Awakening Rust
+
+While fixing Python, we also addressed the missing Rust data. Our investigation revealed a simple oversight: we were generating the report, but we never told SonarQube where to find it.
+
+Unlike C++, which required a plugin and a format converter, **Rust** support in the Community Build is robust. The documentation confirms that the native Rust sensor supports **LCOV** ingestion out of the box.
+
+We simply need to map the file we generated in our CI pipeline (`coverage.rust.info`) to the correct property key.
+
+**Action: Update `sonar-project.properties`**
+
+```properties
+# --- COVERAGE REPORTING ---
+
+# 2. Rust (LCOV)
+# Native support in Community Edition requires this specific property.
+# It tells the Rust sensor to read the LCOV file we generated with cargo-llvm-cov.
+sonar.rust.lcov.reportPaths=coverage.rust.info
+```
+
+This is a "First Principles" lesson in configuration: tools are useless if they are disconnected. We spent effort generating the data, but without this single line of glue code, that effort was invisible to the system.
+
+## 9.4 The Surgeon's Scalpel (Coverage Exclusions)
+
+Finally, we apply a more granular tool: **Coverage Exclusions**.
+
+Sometimes, you have code that *is* production code (it belongs in `sonar.sources`), but it is structurally impossible or architecturally unnecessary to unit test.
+
+In our "Hero Project," our Rust implementation includes two binary entry points: `src/bin/httprust_client.rs` and `src/bin/reqwest_client.rs`. These files are thin wrappers—simple `main()` functions that parse arguments and call the library. Testing `main()` functions is notoriously difficult and often yields low value.
+
+However, because they are in `src/`, SonarQube treats them as production code and penalizes us for their 0% coverage.
+
+We do not want to use `sonar.exclusions`, because that would hide them completely. We *want* SonarQube to scan them for bugs (e.g., a memory leak in `main`). We just don't want them dragging down our coverage score.
+
+The solution is **`sonar.coverage.exclusions`**.
+
+```properties
+# 3. Coverage Exclusions
+# The Surgeon's Scalpel: Analyzed for bugs, but ignored for coverage stats.
+# We exclude the Rust binaries (executables)
+sonar.coverage.exclusions=src/rust/src/bin/**
+```
+
+This is the difference between a "blunt instrument" (hiding the file) and a "precision tool" (tuning the metric).
+
+**The Payoff:**
+With these three changes—splitting scopes, mapping Rust reports, and excluding entry points—we committed the configuration and ran the build.
+
+The result was definitive. Our coverage score, once a broken 0% or a noisy 24%, stabilized at a rock-solid **94.1%**. We now have a clean, accurate signal.
+
+## 9.5 The Blueprint: Deconstructing `sonar-project.properties`
+
+We have modified our `sonar-project.properties` file iteratively throughout this process. Now, let us step back and analyze the complete, final "Blueprint" that drives our inspection.
+
+This file is the single source of truth for the scanner. It bridges the gap between our source code structure and SonarQube's expectations.
+
+```properties
+# 1. Project Identification
+# This key is the unique ID of the project in SonarQube's database.
+# Since we imported this project from GitLab, we MUST use the key
+# generated by SonarQube (e.g., with the UUID suffix).
+# You can find this key in the SonarQube UI -> Project Information.
+sonar.projectKey=articles_0004_std_lib_http_client_47ae4183-478d-4d13-bb80-86217c694444
+
+# 2. Analysis Scope (The "What")
+# sonar.sources defines Production Code (analyzed for bugs + coverage required).
+# We include 'src' (application code) and 'include' (C++ headers).
+sonar.sources=src,include
+
+# sonar.tests defines Test Code (analyzed for bugs + NO coverage required).
+# We explicitly move 'src/python/tests' here to fix our Python coverage ratio.
+sonar.tests=tests, src/python/tests
+
+# sonar.exclusions removes files from analysis entirely (invisible to SonarQube).
+# We hide build artifacts (.o, .so) and temporary directories.
+sonar.exclusions=build_debug/**, build_release/**, **/*.o, **/*.so, **/*.a, **/*.zip, **/*.crate, **/*.whl
+
+# sonar.coverage.exclusions keeps files visible but ignores them for coverage stats.
+# We use this for our Rust binary entry points, which are hard to unit test.
+sonar.coverage.exclusions=src/rust/src/bin/**
+
+# 3. Language Specifics
+# We hint the scanner to use Python 3.12 parsing rules.
+sonar.python.version=3.12
+# We explicitly tell the 'sonar-cxx' plugin which extensions it owns.
+sonar.cxx.file.suffixes=.cxx,.cpp,.cc,.c,.h,.hpp
+
+# 4. Coverage Reporting (The "Evidence")
+# Python: Native Cobertura XML support.
+sonar.python.coverage.reportPaths=coverage.python.xml
+
+# Rust: Native LCOV support (Community Build feature).
+sonar.rust.lcov.reportPaths=coverage.rust.info
+
+# C/C++: Cobertura XML support via the 'sonar-cxx' community plugin.
+# Note that we point to the file generated by our lcov_cobertura converter.
+sonar.cxx.cobertura.reportPaths=coverage.cxx.xml
+```
+
+### Where to find the Values
+
+* **`sonar.projectKey`**: This is the most critical value. If you get this wrong, the scanner will create a *new* project instead of updating the existing one. You find this in the SonarQube UI:
+    1.  Go to your Project Dashboard.
+    2.  Click **Project Information** (usually on the right sidebar).
+    3.  Copy the **Project Key**.
+* **`sonar.sources` / `sonar.tests`**: These are relative paths from your repository root. You determine these by looking at your project structure (`ls -R`).
+* **`sonar.*.reportPaths`**: These must match the output filenames defined in your `run-coverage-cicd.sh` script. Consistency between the shell script (Builder) and this properties file (Inspector) is mandatory.
+
