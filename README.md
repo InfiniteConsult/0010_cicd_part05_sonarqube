@@ -953,3 +953,178 @@ Because this is a configuration setting inside the SonarQube application (applic
 * **The Endpoint (`/sonarqube-webhook/`):** This specific endpoint is exposed by the **SonarQube Scanner for Jenkins** plugin we installed in Article 8. It listens specifically for the JSON payload that SonarQube sends when a background task completes.
 
 Click **Create**. The bridge is now complete. Traffic can flow from Factory to Inspector and back again. We are ready to test the flow.
+
+# Chapter 6: The Toolchain Crisis - When Versions Collide
+
+## 6.1 The Incident (The "Green Build" Breaks)
+
+With our connectivity established and our project created in SonarQube, we were ready to attempt our first full "Quality Gate" build. We needed to transform our pipeline from a simple builder into an analytical engine.
+
+To do this, we first had to adapt our coverage generation logic. Our existing `run-coverage.sh` was designed for humans, generating graphical HTML reports. SonarQube, however, is a machine; it requires structured data formats like **LCOV** (for C/C++ and Rust) and **Cobertura XML** (for Python).
+
+We created a dedicated CI script, `run-coverage-cicd.sh`, to generate these specific artifacts.
+
+```bash
+#!/usr/bin/env bash
+# run-coverage-cicd.sh
+
+set -e
+
+# --- 1. C/C++ Coverage (LCOV) ---
+echo "--- Running C/C++ Tests & Coverage ---"
+(
+    mkdir -p build_debug
+    cd build_debug || exit
+
+    # Ensure Debug build for coverage flags
+    cmake -DCMAKE_BUILD_TYPE=Debug ..
+    cmake --build . -- -j$(nproc)
+
+    # Reset counters
+    lcov --directory . --zerocounters
+
+    # Run Tests
+    ctest --output-on-failure
+
+    # Capture Coverage
+    lcov --capture \
+         --directory . \
+         --output-file coverage.info
+
+    # Filter Artifacts
+    lcov --remove coverage.info \
+         '/usr/*' \
+         '*/_deps/*' \
+         '*/tests/helpers.h' \
+         '*/benchmark/*' \
+         '*/apps/*' \
+         '*/docs/*' \
+         '*/cmake/*' \
+         '*/.cache/*' \
+         -o coverage.filtered.info
+
+    # Move to root for scanner pickup
+    mv coverage.filtered.info ../coverage.cxx.info
+)
+
+# ... (Rust and Python sections omitted for brevity) ...
+```
+
+Next, we updated our `Jenkinsfile`. We replaced the old coverage script with our new CI-specific version and added the **Code Analysis** stage. Crucially, we wrapped the scanner in the `withSonarQubeEnv` block to inject our credentials and added the `waitForQualityGate` step to enforce the "Stop the Line" logic.
+
+```groovy
+        stage('Test & Coverage') {
+            steps {
+                echo '--- Running Tests & Generating Reports ---'
+                sh 'chmod +x ./run-coverage-cicd.sh'
+                sh './run-coverage-cicd.sh'
+            }
+        }
+
+        stage('Code Analysis') {
+            steps {
+                // Inject SONAR_HOST_URL and SONAR_AUTH_TOKEN
+                withSonarQubeEnv('SonarQube') {
+                    sh 'sonar-scanner'
+                }
+                
+                // Pause pipeline and wait for the Quality Gate webhook
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+```
+
+We pushed this configuration to GitLab, expecting the pipeline to turn green and populate our SonarQube dashboard with rich metrics.
+
+Instead, the build crashed.
+
+## 6.2 Forensics: CMake vs. LCOV
+
+The Jenkins console output painted a very clear, albeit cryptic, picture of the disaster. Hidden among the standard build noise was this fatal error message:
+
+```text
+lcov: ERROR: (version) Incompatible GCC/GCOV version found while processing ...
+    Your test was built with 'B42*'.
+    You are trying to capture with gcov tool '/usr/local/bin/gcov' which is version 'B52*'.
+```
+
+To a systems programmer, this message is a "smoking gun." The GCOV data format is tightly coupled to the compiler version. The codes **`B42`** and **`B52`** are internal version identifiers for the GCOV format:
+
+* **`B42` corresponds to GCC 12.** This is the default system compiler shipped with Debian 12.
+* **`B52` corresponds to GCC 15.** This is the bleeding-edge compiler we manually compiled and installed in **Article 8**.
+
+This error revealed a critical **"Split-Brain"** condition in our Factory Worker.
+
+When the pipeline ran, two different tools made two different decisions about which compiler to use, resulting in a binary incompatibility:
+
+1.  **The Builder (CMake):** When we ran `cmake ..`, it scanned the system for a C++ compiler. Because we had not explicitly told it otherwise, it looked for the standard `/usr/bin/c++` executable. On Debian, this is a symlink to the system's default **GCC 12**. It built our binaries using the old compiler.
+2.  **The Inspector (LCOV):** When we ran `lcov`, it needed to use the `gcov` utility to read the coverage files. It searched the system `PATH`. Because we had added `/usr/local/bin` to the start of the `PATH` in our Dockerfile, it found our custom **GCC 15** `gcov` executable first.
+
+The result was a pipeline that built code with one version (v12) and tried to analyze it with another (v15). Since the binary format for coverage artifacts (`.gcno`) changes between major GCC versions, the analyzer crashed immediately.
+
+We had spent hours compiling a custom toolchain to avoid "it works on my machine" issues, yet our automated agent had silently drifted back to system defaults for compilation. To fix this, we had to understand *why* the agent behaved differently than our `dev-container`, where this setup worked perfectly.
+
+## 6.3 The "Drift": Interactive vs. Non-Interactive Shells
+
+The key to this mystery lay in a subtle distinction between how we use Docker as humans versus how Jenkins uses it as a machine.
+
+When we, as developers, log into our `dev-container`, we typically start a `bash` shell. This is an **Interactive Shell**. When it starts, it reads configuration files like `~/.bashrc` to set up the user's environment. In **Article 1**, we added lines to `.bashrc` to export `CC=/usr/local/bin/gcc` and `CXX=/usr/local/bin/g++`. This ensured that whenever we typed `cmake`, our custom compiler was active.
+
+Jenkins, however, does not log in like a human. When the Jenkins Agent connects to the controller and executes a pipeline step (`sh './run-coverage-cicd.sh'`), it runs a **Non-Interactive, Non-Login Shell**.
+
+In this mode, **`.bashrc` is ignored**.
+
+Because the environment variables were defined only in a user configuration file and not at the system level, the Jenkins agent reverted to the default behavior. It ignored our custom compiler settings, found the system default `/usr/bin/c++`, and built the project with GCC 12. Meanwhile, our `lcov` tool—installed globally in `/usr/local/bin`—remained at version 15.
+
+This "Environmental Drift" is a classic failure mode in CI/CD. It highlights why relying on user-level dotfiles (`.bashrc`, `.profile`) is dangerous for automation. To fix this, we must move our configuration from the "User Layer" to the "Image Layer."
+
+## 6.4 The Fix: Immutable Environment Variables
+
+To solve this permanently, we must bake our toolchain selection directly into the Docker image metadata, ensuring it applies to *every* process, regardless of how it is spawned.
+
+We will return to **Article 8** and patch our `Dockerfile.agent`. We will use the `ENV` instruction to set the `CC`, `CXX`, and `LD_LIBRARY_PATH` variables. Unlike `RUN export ...`, which only affects the current build step, `ENV` variables persist in the final image.
+
+We will inject these instructions *after* our heavy compilation steps (GCC and Python) but *before* the final setup. This preserves our Docker build cache, saving us from recompiling GCC 15 (which takes \~30 minutes).
+
+**File Location:** `~/Documents/FromFirstPrinciples/articles/0008_cicd_part04_jenkins/Dockerfile.agent`
+
+Insert this block after the Python build loop:
+
+```dockerfile
+# ... (End of Step 8: Build Python) ...
+
+# 8.5. Force CMake to use the custom GCC
+# We update .bashrc for interactive shells and set ENV for CI pipelines.
+RUN echo "export CC=/usr/local/bin/gcc" >> /root/.bashrc \
+    && echo "export CXX=/usr/local/bin/g++" >> /root/.bashrc \
+    && echo "export CC=/usr/local/bin/gcc" >> /home/jenkins/.bashrc \
+    && echo "export CXX=/usr/local/bin/g++" >> /home/jenkins/.bashrc
+
+ENV CC="/usr/local/bin/gcc"
+ENV CXX="/usr/local/bin/g++"
+ENV LD_LIBRARY_PATH="/usr/local/lib64:${LD_LIBRARY_PATH}"
+
+# ... (Start of Step 9: Install SonarScanner) ...
+```
+
+## 6.5 Verification
+
+With the patch applied, we must rebuild the agent image.
+
+1.  **Rebuild:** Run the builder script from **Article 8**:
+
+    ```bash
+    cd ~/Documents/FromFirstPrinciples/articles/0008_cicd_part04_jenkins
+    ./02-build-images.sh
+    ```
+
+    Because we inserted the new instructions *after* the heavy compilation steps, Docker will use cached layers for GCC and Python. The rebuild should take seconds, not minutes.
+
+2.  **Retest:** Trigger the `0004_std_lib_http_client` job in Jenkins again.
+
+**The Result:**
+The `Incompatible GCC/GCOV version` error vanishes. CMake now correctly picks up our `ENV CC` variable, uses GCC 15 for compilation, and produces binaries compatible with our GCOV 15 analyzer.
+
+However, solving one problem reveals another. The logs now show a new warning: `lcov: WARNING: (inconsistent) ...`. We have fixed the toolchain, but now we must tune the analyzer. This leads us to our next challenge.
