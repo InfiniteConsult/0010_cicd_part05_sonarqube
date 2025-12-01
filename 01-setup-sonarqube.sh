@@ -37,21 +37,25 @@ SYSCTL_CONF="/etc/sysctl.conf"
 echo "--- Phase 1: Checking Kernel Parameters ---"
 
 # A. Runtime Check (Immediate Fix)
-CURRENT_RUNTIME_MAP=$(sudo sysctl -n vm.max_map_count)
+# We read the current value from the kernel
+CURRENT_RUNTIME_MAP=$(sysctl -n vm.max_map_count)
+
 if [ "$CURRENT_RUNTIME_MAP" -lt "$REQUIRED_MAX_MAP" ]; then
     echo "Limit too low ($CURRENT_RUNTIME_MAP). Updating immediately..."
+    # Apply the fix to the live kernel
     sudo sysctl -w vm.max_map_count=$REQUIRED_MAX_MAP
 else
     echo "Runtime limit is sufficient ($CURRENT_RUNTIME_MAP)."
 fi
 
 # B. Persistence Check (sysctl.conf)
+# We ensure the setting survives a reboot
 echo "    Checking persistence in $SYSCTL_CONF..."
 
 # Check if entry exists (handling optional leading whitespace)
-if sudo grep -q "^\s*vm.max_map_count" "$SYSCTL_CONF"; then
+if grep -q "^\s*vm.max_map_count" "$SYSCTL_CONF"; then
     # Value exists, extract it (handling spaces around '=')
-    STORED_VAL=$(sudo grep "^\s*vm.max_map_count" "$SYSCTL_CONF" | awk -F= '{print $2}' | tr -d '[:space:]')
+    STORED_VAL=$(grep "^\s*vm.max_map_count" "$SYSCTL_CONF" | awk -F= '{print $2}' | tr -d '[:space:]')
 
     # Ensure we captured a number
     if [[ ! "$STORED_VAL" =~ ^[0-9]+$ ]]; then
@@ -123,4 +127,4 @@ chmod 600 "$SCOPED_ENV_FILE"
 echo "Setup complete."
 echo "   Kernel configured."
 echo "   Secrets injected into $SCOPED_ENV_FILE"
-echo "   Ready to run 02-deploy-sonarqube.sh"
+echo "   Ready to run 02-build-image.sh"
