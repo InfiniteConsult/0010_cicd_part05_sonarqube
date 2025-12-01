@@ -1287,3 +1287,167 @@ When the analysis completes, check the SonarQube dashboard. You will notice a si
 3.  **Coverage:** This will likely still be **0.0%**.
 
 We have solved the **Indexing** problem (the files are visible), but we have not solved the **Metrics** problem. The plugin sees the code, but it cannot read the coverage report because the data format we are generating (LCOV) is clashing with the plugin's path resolution logic. This leads us to our next battle: The Data Format War.
+
+# Chapter 8: The Data Format War - LCOV vs. Cobertura
+
+## 8.1 The "Tower of Babel"
+
+We have successfully "jailbroken" our Community Build. By injecting the `sonar-cxx` plugin, we forced the scanner to acknowledge the existence of our C++ code. If you look at the dashboard now, you will see our `.cpp` files listed in the "Code" tab, and the "Lines of Code" metric finally reflects reality.
+
+However, a deeper look reveals a new failure. The **Coverage** column for C++ remains at **0.0%**, even though our Jenkins logs clearly show `lcov` successfully capturing data. We have the files, but we don't have the metrics.
+
+To understand why, we must look at the scanner logs from our last build. Hidden amongst the success messages is a flood of warnings:
+
+```text
+WARN  Cannot sanitize file path './../src/c/httpc.c', ignoring coverage measures
+WARN  Cannot sanitize file path './../src/cpp/httpcpp.cpp', ignoring coverage measures
+```
+
+This is a classic "Tower of Babel" problem. Our builder and our inspector are speaking different languages regarding **File Paths**.
+
+1.  **The Builder's Perspective:** We executed our tests and coverage capture inside the `build_debug` directory. From that vantage point, the source code lives one directory up (`../src`). `lcov` faithfully recorded these relative paths in the tracefile.
+2.  **The Inspector's Perspective:** The SonarQube Scanner runs from the **Project Root**. It expects all paths to be relative to the root (e.g., `src/c/httpc.c`).
+
+When the plugin reads the LCOV file, it sees a record for `../src/c/httpc.c`. It tries to match this against the file index it built from the root. Since `../src` implies a path *outside* the project root, the sanitizer rejects it as a security risk or simply fails to map it. The data is discarded to prevent database corruption.
+
+To fix this, we must align our perspectives. We need a format that is robust enough to handle path translation, or we need to change our execution context so the paths match naturally.
+
+## 8.2 The Converter Strategy
+
+We have two options to solve this.
+
+The "Hacker" approach would be to use `sed` to rewrite the text inside the LCOV file, stripping the `../` prefix before the scanner sees it. This is fragile. If we ever change our build directory depth (e.g., `build/debug/x86`), our pipeline breaks.
+
+The "First Principles" approach is to fix the **Execution Context**.
+
+The relative paths are being generated because we are running the `lcov --capture` command *inside* the `build_debug` directory. To `lcov`, the source files *are* literally one level up.
+
+If we move the execution of the capture command to the **Project Root**, the perspective changes. From the root, the source files are in `src/` and the object files are in `build_debug/`. If we tell `lcov` to capture from the root, it will generate paths starting with `src/`, which is exactly what SonarQube expects.
+
+Additionally, we will convert this data into **Cobertura XML**. While the `sonar-cxx` plugin supports LCOV, the Cobertura format is the "Lingua Franca" of CI/CD. It is more widely supported by other tools (like Jenkins' own coverage view) and tends to be more robust against path quirks than raw LCOV tracefiles.
+
+We will use a Python tool called `lcov_cobertura` to perform this translation on the fly. This fits perfectly into our polyglot agent, as we already have a Python environment available.
+
+## 8.3 The Patch (`run-coverage-cicd.sh`)
+
+We need to rewrite the C++ section of our coverage script to change *where* the commands run.
+
+**The Changes:**
+
+1.  **Context Switch:** We move the `lcov` capture logic *outside* the subshell that enters `build_debug`.
+2.  **Base Directory:** We explicitly tell `lcov` that our base directory is the current folder (`.`), ensuring paths are calculated relative to the project root.
+3.  **The Converter:** We install `lcov_cobertura` inside our existing Python virtual environment (to avoid PEP 668 system package errors) and use it to generate the final XML report.
+
+Update your **`run-coverage-cicd.sh`** with the following logic:
+
+```bash
+#!/usr/bin/env bash
+# ... (Header) ...
+
+set -e
+
+# --- 1. C/C++ Coverage (LCOV) ---
+echo "--- Running C/C++ Tests & Coverage ---"
+
+# A. Zero Counters (Run from Root, targeting build dir)
+mkdir -p build_debug
+lcov --directory build_debug --zerocounters --ignore-errors inconsistent,unused,negative -q
+
+# B. Build & Run Tests (Inside build dir)
+(
+    cd build_debug || exit
+    # Ensure Debug build for coverage flags
+    cmake -DCMAKE_BUILD_TYPE=Debug ..
+    cmake --build . -- -j$(nproc)
+    ctest --output-on-failure
+)
+
+# C. Capture & Filter (Run from Root)
+# We capture from the root so paths like 'src/c/httpc.c' are relative to here.
+lcov --capture \
+     --directory build_debug \
+     --output-file coverage.cxx.info \
+     --ignore-errors inconsistent,unused,negative \
+     --base-directory .
+
+# Filter Artifacts
+lcov --remove coverage.cxx.info \
+     '/usr/*' \
+     '*/_deps/*' \
+     '*/tests/helpers.h' \
+     '*/benchmark/*' \
+     '*/apps/*' \
+     '*/docs/*' \
+     '*/cmake/*' \
+     '*/.cache/*' \
+     -o coverage.cxx.filtered.info \
+     --ignore-errors inconsistent,unused,negative
+
+# Rename for final use
+mv coverage.cxx.filtered.info coverage.cxx.info
+
+# ... (Rust Section Unchanged) ...
+
+# --- 3. Python Coverage (XML) ---
+echo "--- Running Python Tests & Installing Tools ---"
+(
+    if [ -d ".venv" ]; then
+        . .venv/bin/activate
+    fi
+    cd src/python
+
+    # Install lcov_cobertura here (inside the venv)
+    python3 -m pip install --editable .[test] lcov_cobertura --quiet
+
+    # Run Python Tests
+    pytest -sv --cov=httppy --cov-report=xml:../../coverage.python.xml tests
+)
+echo "✅ Python coverage generated: coverage.python.xml"
+
+
+# --- 4. Convert C++ LCOV to Cobertura XML (From Root) ---
+echo "--- Converting C++ LCOV to Cobertura XML ---"
+(
+    # Activate the venv (using relative path from Root) to get access to lcov_cobertura
+    if [ -f "src/python/.venv/bin/activate" ]; then
+        . src/python/.venv/bin/activate
+    elif [ -f ".venv/bin/activate" ]; then
+        . .venv/bin/activate
+    fi
+
+    # Run conversion from ROOT so paths remain 'src/c/...' (matching the LCOV input)
+    lcov_cobertura coverage.cxx.info --output coverage.cxx.xml
+)
+echo "✅ C/C++ Cobertura XML generated: coverage.cxx.xml"
+```
+
+## 8.4 Verification: Closing the Loop
+
+We have successfully bridged the "Tower of Babel." Our coverage script now performs a sophisticated translation: it compiles in C++, captures in LCOV, translates to Cobertura XML, and aligns all file paths to the project root.
+
+Now, we must tell the "Inspector" where to find this translated map.
+
+We return to our `sonar-project.properties` file. Previously, we attempted to use `sonar.cxx.lcov.reportPath`. We must now replace this with the Cobertura-specific property supported by the community plugin.
+
+**Action: Update `sonar-project.properties`**
+
+```properties
+# ... (Previous Python/Rust config) ...
+
+# 3. C/C++ (Cobertura XML via sonar-cxx plugin)
+# We replaced the LCOV property with the Cobertura property
+# pointing to the file generated by our Python converter.
+sonar.cxx.cobertura.reportPaths=coverage.cxx.xml
+```
+
+**The Final Test**
+
+Commit this change and trigger the **`0004_std_lib_http_client`** job in Jenkins one last time.
+
+When the build completes, open the SonarQube dashboard. You will witness the final piece of the puzzle falling into place:
+
+1.  **Lines of Code:** C++ is present.
+2.  **Issues:** C++ code smells are present.
+3.  **Coverage:** The "0.0%" is gone. You should see a valid coverage percentage (likely \>90% given our test suite) for your `.cpp` files.
+
+We have achieved what the official documentation implies is impossible for the Community Build: full, polyglot coverage analysis for C++, Rust, and Python in a single pipeline.
