@@ -1610,3 +1610,134 @@ sonar.cxx.cobertura.reportPaths=coverage.cxx.xml
 * **`sonar.sources` / `sonar.tests`**: These are relative paths from your repository root. You determine these by looking at your project structure (`ls -R`).
 * **`sonar.*.reportPaths`**: These must match the output filenames defined in your `run-coverage-cicd.sh` script. Consistency between the shell script (Builder) and this properties file (Inspector) is mandatory.
 
+# Chapter 10: The Gatekeeper - Enforcing MQR Standards
+
+## 10.1 The Shift to MQR (Multi-Quality Rule) Mode
+
+When you open your SonarQube dashboard for the first time after a successful analysis, you might notice that the terminology differs from older tutorials or legacy versions of the software.
+
+In previous versions of SonarQube, issues were categorized into three rigid types: **Bugs**, **Vulnerabilities**, and **Code Smells**. While functional, this taxonomy often led to ambiguity. Is a memory leak a "Bug" or a "Code Smell"? Is a hardcoded password a "Vulnerability" or a "Security Hotspot"?
+
+Modern SonarQube (specifically the v10.x and v25.x Community Builds we are using) has shifted to a new default paradigm called **MQR (Multi-Quality Rule) Mode**.
+
+This mode reorients the analysis around three fundamental **Software Qualities**:
+
+1.  **Reliability:** Will the software crash? Issues here include logic errors, unhandled exceptions, and memory leaks.
+2.  **Security:** Can the software be exploited? Issues here include injection flaws, weak cryptography, and hardcoded secrets.
+3.  **Maintainability:** Can the software be updated? Issues here include high cognitive complexity, duplicated blocks, and spaghetti code.
+
+### The Severity Shift
+Crucially, MQR Mode decouples the *Type* of issue from its *Severity*. An issue is no longer just "Critical" or "Minor." It is rated on a specific scale of impact for each quality dimension:
+
+* **Blocker:** A high probability of high impact (e.g., a buffer overflow). Immediate fix required.
+* **High:** High impact or high probability.
+* **Medium:** Moderate impact.
+* **Low:** Low impact.
+* **Info:** Contextual information.
+
+### The "Sonar way" Gate
+This shift directly impacts how our **Quality Gate** functions.
+
+The default "Sonar way" gate that is currently applied to our project does not simply say "No Bugs." It enforces specific MQR metrics on **New Code**:
+
+* **Reliability Rating:** Must be **A** (No High/Blocker reliability issues).
+* **Security Rating:** Must be **A** (No High/Blocker security issues).
+* **Maintainability Rating:** Must be **A** (Technical Debt Ratio < 5%).
+* **Coverage:** Must be **>= 80.0%**.
+* **Duplicated Lines:** Must be **<= 3.0%**.
+
+By understanding this taxonomy, we understand what is required to pass the gate. It is not enough to just "write tests" (Coverage); we must also write clean, secure code (MQR Ratings).
+
+
+## 10.2 The Logic of the Gate (`waitForQualityGate`)
+
+Now that we understand the criteria, we must examine the mechanism that enforces them.
+
+In our **Article 9** pipeline, we simply uploaded artifacts. If the build produced a binary, we shipped it. In our updated `Jenkinsfile`, we introduced a critical new step:
+
+```groovy
+timeout(time: 5, unit: 'MINUTES') {
+    waitForQualityGate abortPipeline: true
+}
+```
+
+This step is not a simple "sleep" command. It is a sophisticated, asynchronous state machine.
+
+1.  **The Handover:** When the `sonar-scanner` finishes uploading the report, it leaves behind a metadata file (`report-task.txt`) in the workspace. This file contains a **Compute Engine Task ID (`ceTaskId`)**.
+2.  **The Pause:** The `waitForQualityGate` step reads this ID. It then puts the Jenkins pipeline into a "Paused" state. The heavy executor is released (depending on the agent configuration), and the job enters a lightweight listening mode.
+3.  **The Processing:** On the SonarQube server, the Compute Engine processes the report, calculates the metrics, and compares them against the Quality Gate conditions.
+4.  **The Callback:** Once the status is determined (OK or ERROR), SonarQube uses the **Webhook** we configured in Chapter 5 to call back to Jenkins. It sends a JSON payload containing the status for that specific `ceTaskId`.
+5.  **The Decision:** Jenkins receives the webhook. If the payload says `status: "OK"`, the pipeline resumes and proceeds to the **Package** stage. If it says `status: "ERROR"`, the `abortPipeline: true` flag triggers an immediate build failure, stopping the conveyor belt before a bad artifact can be created.
+
+## 10.3 The "Stop the Line" Verification
+
+To prove that this system works, we must force a failure.
+
+However, triggering a failure naturally can be difficult in a new environment. The default "Sonar way" gate only checks **New Code**. Since our coverage is currently high (94.1%), and we haven't introduced new bugs, our build is passing.
+
+To simulate a "Bad Build," we will create a draconian Quality Gate that demands perfection—**100% Coverage**—and apply it to our project. Since we are at 94.1%, this is guaranteed to fail.
+
+### Action 1: Create the "Fail-Hard" Gate
+
+1.  Log in to SonarQube (`http://sonarqube.cicd.local:9000`).
+2.  Navigate to **Quality Gates**.
+3.  Click **Create**.
+4.  **Name:** `fail-hard`.
+5.  **Add Condition:**
+    * **Where:** **Overall Code** (We want to fail immediately based on current state).
+    * **Quality Gate fails when:** Select **Coverage**.
+    * **Operator:** **is less than**.
+    * **Value:** `100.0`.
+6.  Click **Add Condition**.
+
+### Action 2: Enforce the Gate
+
+We must now assign this strict gate to our specific project.
+
+1.  Navigate to the **`articles_...`** Project Dashboard.
+2.  Click **Project Settings** \> **Quality Gate**.
+3.  Select **Always use a specific Quality Gate**.
+4.  Choose **`fail-hard`** from the dropdown.
+5.  Click **Save**.
+
+### Action 3: The Failed Build
+
+Go to Jenkins and trigger the **`0004_std_lib_http_client`** job again.
+
+**The Observation:**
+
+1.  The **Test & Coverage** stage will pass (Green).
+2.  The **Code Analysis** stage will start. The scanner will run.
+3.  The pipeline will pause at `Checking status of SonarQube task...`.
+4.  A few seconds later, the pipeline will turn **Red** and abort.
+
+**The Evidence:**
+If you check the Console Output, you will see:
+`SonarQube task '...' Quality gate is 'ERROR'`
+`Stage "Package" skipped due to earlier failure(s)`
+`Stage "Publish" skipped due to earlier failure(s)`
+`ERROR: Pipeline aborted due to quality gate failure: ERROR`
+
+Crucially, if you check **Artifactory**, you will see that **no new artifacts were uploaded** for this build number. The system worked. The "Inspector" stopped the line, preventing a non-compliant product from reaching the warehouse.
+
+You can now revert the Quality Gate setting in SonarQube back to **"Sonar way"** to restore the passing state.
+
+## 10.4 Conclusion
+
+We have reached a pivotal moment in our "City Planning."
+
+With the deployment of SonarQube and the enforcement of the Quality Gate, our infrastructure has evolved from a simple "build loop" into a sophisticated **High-Assurance Software Supply Chain**.
+
+Let's review the architectural state of our city:
+1.  **The Library (GitLab):** Stores our blueprints securely.
+2.  **The Factory (Jenkins):** Compiles our polyglot code using a precise, immutable toolchain (GCC 15/Python 3.12), resolving the binary incompatibility issues that plague manual builds.
+3.  **The Inspector (SonarQube):** Analyzes the output using a custom-built image that trusts our internal PKI, ingesting data from three different languages (C++, Rust, Python) through a unified dashboard.
+4.  **The Warehouse (Artifactory):** Receives *only* those artifacts that have passed the Inspector's rigorous MQR standards.
+
+We have solved the "Quantity over Quality" problem. We are no longer filling our warehouse with time bombs. If a developer commits code that leaks memory or fails tests, the factory line stops immediately. The artifact is rejected. The system protects itself.
+
+However, despite this sophistication, our city has one remaining flaw: **It is silent.**
+
+When the Quality Gate slammed shut in our last test, the only way you knew was because you were staring at the Jenkins console. In a real team, developers push code and move on to the next task. They need to be notified *actively* when something breaks. They need the city to speak to them.
+
+In the next article, we will install the "Public Address System" of our city. We will deploy **Mattermost**, an open-source ChatOps platform. We will connect it to our Factory and our Inspector, ensuring that when the line stops, the entire engineering team gets the alert instantly.
