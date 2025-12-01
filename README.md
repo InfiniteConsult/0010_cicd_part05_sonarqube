@@ -278,3 +278,111 @@ Our `01-setup-sonarqube.sh` script enforces this relationship. Before it writes 
 * **If the variable exists:** It assumes the utility is online and proceeds to provision the application.
 
 This logic prevents "Orphaned Services"—applications deployed without a backend—and ensures that our infrastructure is built in the correct, layered order: **Network $\rightarrow$ Storage $\rightarrow$ Database $\rightarrow$ Application.**
+
+# Chapter 3: The Trust Gap - A Familiar Foe
+
+## 3.1 The Connectivity Paradox (and a Confession)
+
+In our initial attempt to deploy this service, we fell into a trap. We launched the official `sonarqube:community` image, updated our host's `/etc/hosts` file to resolve `sonarqube.cicd.local` to `127.0.0.1`, and successfully accessed the UI on port 9000. The dashboard loaded, the database connected, and the logs were clean. We felt victorious.
+
+Then, we tried to configure the **GitLab** integration. We entered our GitLab URL (`https://gitlab.cicd.local:10300/api/v4`) and clicked "Save."
+
+The result was an immediate crash: `PKIX path building failed`.
+
+We must make a confession: even after ten articles of preaching "First Principles," we got lulled into a false sense of security by the **Community Build's** primary limitation. Because this version of SonarQube does not support *inbound* HTTPS (forcing us to run it as an HTTP service), we mentally categorized it as an "insecure" service.
+
+This was a mistake. While SonarQube listens on HTTP, it acts as a **Client** to other services in our city. To import projects, it must talk to GitLab. To authenticate users, it might need to talk to LDAP. To send webhooks, it must talk to Jenkins.
+
+All of these internal services are secured by our **Local Root CA**. The official SonarQube container, running a standard OpenJDK runtime, has no knowledge of this CA. It is an island. When it attempts to handshake with GitLab, it sees an unknown certificate issuer and terminates the connection to protect itself.
+
+We cannot simply "turn off SSL verification" in SonarQube without compromising the integrity of our entire architecture. We must fix the root of trust.
+
+## 3.2 The "Builder" Pattern (Revisited)
+
+We faced this exact problem with the **Jenkins Controller** in Article 8. The solution remains the same.
+
+We reject the "quick fix" of bind-mounting the host's `/etc/ssl/certs/java/cacerts` file into the container. This is fragile; if the container's Java version (e.g., Java 17) differs from the host's Java version (e.g., Java 11), the binary keystore format may be incompatible, leading to cryptic startup failures.
+
+Instead, we will apply the **Builder Pattern**. We will create a `Dockerfile` that extends the official image, briefly switches to the `root` user, and uses the native Java `keytool` utility to "bake" our "Passport Office" license (`ca.pem`) directly into the container's immutable system trust store.
+
+This ensures that any container spawned from this image carries our trust relationships with it, making it a first-class citizen of our secure city.
+
+## 3.3 The Implementation (`02-build-image.sh`)
+
+To execute this, we need two files: the `Dockerfile` blueprint and a builder script to orchestrate the context.
+
+There is a specific nuance here regarding **User Context**. SonarQube runs as a non-privileged user (`sonarqube`, UID 1000). However, modifying the system-wide Java keystore requires root privileges. Our Dockerfile must explicitly handle this privilege escalation and then de-escalate back to the correct user to ensure runtime permissions match our volume mounts.
+
+Create the **`Dockerfile`** in `~/cicd_stack/sonarqube/`:
+
+```dockerfile
+# 1. Start from the official Community Edition
+FROM sonarqube:community
+
+# 2. Switch to root to perform system administration (Certificate Import)
+USER root
+
+# 3. Copy the Local CA from the build context (Current Directory)
+COPY ca.pem /tmp/ca.pem
+
+# 4. Import the CA into the JVM Truststore
+#    We use the $JAVA_HOME environment variable provided by the base image.
+#    The default password for the java truststore is 'changeit'.
+RUN keytool -importcert \
+    -file /tmp/ca.pem \
+    -keystore "$JAVA_HOME/lib/security/cacerts" \
+    -alias "CICD-Root-CA" \
+    -storepass changeit \
+    -noprompt \
+    && rm /tmp/ca.pem
+
+# 5. Switch back to the unprivileged sonarqube user
+USER sonarqube
+```
+
+Now, create the builder script, **`02-build-image.sh`**. This script handles the "Build Context" trap we encountered in previous articles by copying the CA certificate into the current directory before building.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               02-build-image.sh
+#
+#  This is the "Builder" script for SonarQube.
+#  It creates a custom image that trusts our Local Root CA.
+#
+#  1. Staging: Copies ca.pem from the CA directory to CURRENT dir.
+#  2. Build: Creates 'sonarqube-custom:latest' from context '.'.
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- 1. Define Paths ---
+CA_SOURCE="$HOME/cicd_stack/ca/pki/certs/ca.pem"
+
+echo "🚀 Starting SonarQube Custom Build..."
+
+# --- 2. Stage Assets ---
+if [ ! -f "$CA_SOURCE" ]; then
+    echo "ERROR: CA certificate not found at $CA_SOURCE"
+    exit 1
+fi
+
+echo "Copying CA certificate to build context (current dir)..."
+cp "$CA_SOURCE" ./ca.pem
+
+# --- 3. Build Image ---
+echo "Building 'sonarqube-custom:latest'..."
+
+# We build from the current directory where the Dockerfile resides
+docker build -t sonarqube-custom:latest .
+
+# Cleanup staged file
+rm ./ca.pem
+
+echo "✅ Build complete."
+echo "   Image: sonarqube-custom:latest"
+echo "   Ready to run 03-deploy-sonarqube.sh"
+```

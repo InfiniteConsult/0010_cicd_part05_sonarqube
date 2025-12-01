@@ -17,7 +17,7 @@ set -e
 # --- 1. Define Paths ---
 CA_SOURCE="$HOME/cicd_stack/ca/pki/certs/ca.pem"
 
-echo "Starting SonarQube Custom Build..."
+echo "🚀 Starting SonarQube Custom Build..."
 
 # --- 2. Stage Assets ---
 if [ ! -f "$CA_SOURCE" ]; then
@@ -37,6 +37,6 @@ docker build -t sonarqube-custom:latest .
 # Cleanup staged file
 rm ./ca.pem
 
-echo "Build complete."
+echo "✅ Build complete."
 echo "   Image: sonarqube-custom:latest"
 echo "   Ready to run 03-deploy-sonarqube.sh"
